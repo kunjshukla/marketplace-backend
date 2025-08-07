@@ -10,7 +10,7 @@ load_dotenv()
 BASE_DIR = Path(__file__).parent.parent
 
 # Environment variables
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///dev.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 # Google OAuth
