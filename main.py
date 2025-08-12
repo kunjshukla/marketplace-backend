@@ -6,6 +6,9 @@ from contextlib import asynccontextmanager
 import logging
 import os
 from decimal import Decimal
+import time
+import psycopg2
+from psycopg2 import OperationalError
 
 from config.settings import settings
 from db.session import create_tables, SessionLocal, engine
@@ -87,7 +90,6 @@ def ensure_user_columns():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
-    # Startup
     logger.info("Starting NFT Marketplace API...")
     
     # Validate environment variables (non-fatal if missing optional ones)
@@ -95,7 +97,19 @@ async def lifespan(app: FastAPI):
         validate_env_variables()
     except Exception as e:
         logger.warning(f"Env validation warning: {e}")
-    
+
+    # Wait for DB connection (Supabase may be paused or slow to wake)
+    max_attempts = 5
+    for i in range(max_attempts):
+        try:
+            if settings.DATABASE_URL.startswith("postgres"):
+                conn = psycopg2.connect(settings.DATABASE_URL)
+                conn.close()
+            break
+        except OperationalError as e:
+            logger.warning(f"DB not reachable, retrying... ({i+1}/{max_attempts}) {e}")
+            time.sleep(5 * (i+1))
+
     # Create database tables
     create_tables()
     logger.info("Database tables created/verified")
