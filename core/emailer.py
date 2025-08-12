@@ -5,6 +5,7 @@ from email.mime.image import MIMEImage
 from pathlib import Path
 import logging
 from typing import Dict
+from urllib.parse import quote
 
 from config.settings import settings
 from models.transaction import Transaction
@@ -113,8 +114,29 @@ def generate_upi_qr_code(transaction: Transaction) -> Path:
         import qrcode
         from PIL import Image
         
-        # UPI payment URL
-        upi_url = f"upi://pay?pa={settings.UPI_ID}&am={transaction.amount}&tn=NFT Purchase Transaction {transaction.id}&cu=INR"
+        # Compute standard UPI parameters
+        payee_vpa = settings.UPI_ID
+        payee_name = getattr(settings, 'UPI_PAYEE_NAME', None) or 'NFT Marketplace'
+        amount = transaction.amount
+        currency = 'INR'
+        # Use transaction.id as unique reference for this QR
+        tr_ref = str(transaction.id)
+        # Optional note
+        note = f"NFT Purchase Transaction {transaction.id}"
+        
+        # Percent-encode only fields that commonly contain spaces/special chars
+        pn_enc = quote(payee_name, safe='')
+        tn_enc = quote(note, safe='')
+        
+        # UPI payment URL per NPCI spec (common fields)
+        upi_url = (
+            f"upi://pay?pa={payee_vpa}"
+            f"&pn={pn_enc}"
+            f"&am={amount}"
+            f"&cu={currency}"
+            f"&tr={tr_ref}"
+            f"&tn={tn_enc}"
+        )
         
         # Generate QR code
         qr = qrcode.QRCode(
@@ -141,3 +163,32 @@ def generate_upi_qr_code(transaction: Transaction) -> Path:
     except Exception as e:
         logger.error(f"Error generating UPI QR code: {e}")
         return None
+
+# New: send simple payment receipt after automated reconciliation
+
+def send_payment_receipt_email(user_email: str, user_name: str, transaction: Transaction) -> bool:
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['From'] = settings.SMTP_USER
+        msg['To'] = user_email
+        msg['Subject'] = f"Payment confirmed - Transaction #{transaction.id}"
+        body = f"""
+        <html>
+        <body>
+        <p>Hi {user_name},</p>
+        <p>Your payment for transaction <strong>#{transaction.id}</strong> has been confirmed.</p>
+        <p>Amount: ₹{transaction.amount}<br>
+        Reference: {transaction.txn_ref or 'N/A'}</p>
+        <p>Thank you for your purchase.</p>
+        </body>
+        </html>
+        """
+        msg.attach(MIMEText(body, 'html'))
+        smtp = create_smtp_client()
+        smtp.send_message(msg)
+        smtp.quit()
+        logger.info("Sent payment receipt email to %s for tx %s", user_email, transaction.id)
+        return True
+    except Exception as e:
+        logger.warning("Failed to send payment receipt: %s", e)
+        return False

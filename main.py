@@ -19,6 +19,8 @@ from api.auth import router as auth_router
 from api.nft import router as nft_router
 from api.payment import router as payment_router
 from api.email import router as email_router
+from models import *  # noqa: F401,F403 ensure model registration
+from core.reconciliation import start_reconciliation_scheduler, shutdown_reconciliation_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,17 @@ REQUIRED_NFT_COLUMNS = {
     'reserved_at': 'TIMESTAMPTZ',
     'sold_at': 'TIMESTAMPTZ',
     'owner_id': 'INTEGER',
+    'created_at': 'TIMESTAMPTZ DEFAULT NOW()'
+}
+
+REQUIRED_USER_COLUMNS = {
+    'name': 'VARCHAR(255) NOT NULL DEFAULT ""',
+    'email': 'VARCHAR(255) NOT NULL',
+    'google_id': 'VARCHAR(255) NOT NULL',
+    'profile_pic': 'TEXT',
+    'role': 'VARCHAR(50) NOT NULL DEFAULT "user"',
+    'refresh_token': 'TEXT',
+    'is_active': 'BOOLEAN NOT NULL DEFAULT TRUE',
     'created_at': 'TIMESTAMPTZ DEFAULT NOW()'
 }
 
@@ -55,6 +68,22 @@ def ensure_nft_columns():
     except Exception as e:
         logger.warning(f"ensure_nft_columns failed: {e}")
 
+def ensure_user_columns():
+    """Ensure legacy/partial users table has all required columns (Postgres only)."""
+    try:
+        insp = inspect(engine)
+        if 'users' not in insp.get_table_names():
+            logger.info("users table not found yet; metadata create will handle it.")
+            return
+        existing = {c['name'] for c in insp.get_columns('users')}
+        with engine.begin() as conn:
+            for col, ddl in REQUIRED_USER_COLUMNS.items():
+                if col not in existing:
+                    logger.info(f"Adding missing column to users: {col}")
+                    conn.execute(text(f'ALTER TABLE users ADD COLUMN {col} {ddl}'))
+    except Exception as e:
+        logger.warning(f"ensure_user_columns failed: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
@@ -73,6 +102,10 @@ async def lifespan(app: FastAPI):
 
     # Repair legacy nfts table columns (mostly for Postgres migrations)
     ensure_nft_columns()
+    ensure_user_columns()
+
+    # Start reconciliation scheduler if enabled
+    start_reconciliation_scheduler()
     
     # NOTE: Seeding moved to scripts/seed_nfts.py; keep runtime clean
     logger.info("Startup complete. Use 'python -m scripts.seed_nfts auto' to seed images.")
@@ -80,6 +113,7 @@ async def lifespan(app: FastAPI):
     yield
     
     # Shutdown
+    shutdown_reconciliation_scheduler()
     logger.info("Shutting down NFT Marketplace API...")
 
 # Create FastAPI app
@@ -152,6 +186,10 @@ app.include_router(auth_router, prefix="/api")
 app.include_router(nft_router, prefix="/api")
 app.include_router(payment_router, prefix="/api")
 app.include_router(email_router, prefix="/api")
+
+# Backward-compatibility: also expose NFT routes at /nft/* (no /api prefix)
+# This handles older frontend requests like `/nft/list?page=1&limit=50`.
+app.include_router(nft_router)
 
 def custom_openapi():
     if app.openapi_schema:

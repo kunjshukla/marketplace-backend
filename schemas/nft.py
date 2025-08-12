@@ -43,3 +43,9 @@ class NFTListResponse(BaseModel):
     success: bool
     message: str
     data: dict  # Contains nfts, total, skip, limit
+
+# NEW: detail response envelope for /nft/{id}
+class NFTDetailResponse(BaseModel):
+    success: bool
+    message: str
+    data: NFTResponse

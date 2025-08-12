@@ -1,13 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.orm import Session
 from typing import Optional
-import httpx
-import secrets
 import logging
-from datetime import datetime
-import jwt
-import base64
-import json
+import httpx  # Added for token exchange
 
 from db.session import get_db
 from models.user import User
@@ -15,198 +10,185 @@ from schemas.user import UserResponse, TokenResponse, UserUpdate
 from core.auth import create_access_token, create_refresh_token, verify_token, get_current_user
 from config.settings import settings
 
+# New imports for simplified Google token verification
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["authentication"])
+from pydantic import BaseModel, EmailStr
+from datetime import datetime, timedelta
+from utilities.smtp import send_email
+from jose import jwt
 
-# OAuth state storage (in production, use Redis)
-oauth_states = {}
+MAGIC_LINK_EXPIRY_MINUTES = 15
 
-@router.get("/login-google")
-async def login_google():
-    """Initiate Google OAuth login"""
-    state = secrets.token_urlsafe(32)
-    oauth_states[state] = {"created_at": datetime.utcnow()}
+class RequestMagicLinkIn(BaseModel):
+    email: EmailStr
 
-    # Use Google OAuth v2 endpoint and request offline access for refresh tokens
-    authorization_url = (
-        f"https://accounts.google.com/o/oauth2/v2/auth?"
-        f"client_id={settings.GOOGLE_CLIENT_ID}&"
-        f"redirect_uri={settings.GOOGLE_REDIRECT_URI}&"
-        f"scope=openid%20email%20profile&"
-        f"response_type=code&"
-        f"access_type=offline&"
-        f"prompt=consent&"
-        f"state={state}"
-    )
+class VerifyMagicLinkIn(BaseModel):
+    token: str
+
+def create_magic_link_token(email: str) -> str:
+    payload = {
+        "email": email,
+        "exp": datetime.utcnow() + timedelta(minutes=MAGIC_LINK_EXPIRY_MINUTES),
+        "type": "magic_link"
+    }
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+def verify_magic_link_token(token: str) -> str:
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+        if payload.get("type") != "magic_link":
+            raise HTTPException(status_code=400, detail="Invalid token type")
+        return payload["email"]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid or expired link")
+
+@router.post("/request-link")
+async def request_magic_link(data: RequestMagicLinkIn, db: Session = Depends(get_db)):
+    """Send magic login link to email"""
+    token = create_magic_link_token(data.email)
+    link = f"{settings.FRONTEND_URL.rstrip('/')}/login?token={token}"
+    html = f"""
+    <p>Click to log in:</p>
+    <p><a href="{link}">{link}</a></p>
+    <p>This link expires in {MAGIC_LINK_EXPIRY_MINUTES} minutes.</p>
+    """
+    # Ensure user exists or create basic record
+    user = db.query(User).filter(User.email == data.email).first()
+    if not user:
+        user = User(name=data.email.split('@')[0], email=data.email, google_id=f"magic_{data.email}", role="user")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    if not send_email(data.email, "Your Magic Login Link", html):
+        raise HTTPException(status_code=500, detail="Failed to send email")
+    return {"success": True, "message": "Magic link sent"}
+
+@router.post("/verify-link")
+async def verify_magic_link(data: VerifyMagicLinkIn, db: Session = Depends(get_db)):
+    """Verify magic link token and issue session JWTs"""
+    email = verify_magic_link_token(data.token)
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        # Should not happen since we create on request-link, but handle gracefully
+        user = User(name=email.split('@')[0], email=email, google_id=f"magic_{email}", role="user")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    access_token = create_access_token({"user_id": user.id, "email": user.email})
+    refresh_token = create_refresh_token({"user_id": user.id})
+    user.refresh_token = refresh_token
+    db.commit()
+    return {
+        "success": True,
+        "message": "Authentication successful",
+        "data": {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "user": {
+                "id": user.id,
+                "name": user.name,
+                "email": user.email,
+                "profile_pic": user.profile_pic,
+                "role": user.role
+            }
+        }
+    }
+
+
+# Removed legacy OAuth state storage and endpoints (/login-google, /google/callback)
+# Keep only the direct One Tap credential endpoint.
+
+@router.post("/google", summary="Direct Google Sign-In (One Tap / Credential)")
+async def google_direct_sign_in(payload: dict, db: Session = Depends(get_db)):
+    """Accepts { credential: <google id token> } and returns access/refresh tokens."""
+    credential = payload.get("credential")
+    if not credential:
+        raise HTTPException(status_code=400, detail="Missing Google credential")
+    try:
+        idinfo = google_id_token.verify_oauth2_token(credential, google_requests.Request(), settings.GOOGLE_CLIENT_ID)
+    except Exception as e:
+        logger.warning(f"Google token verification failed: {e}")
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+
+    # Hardening checks
+    if idinfo.get("aud") != settings.GOOGLE_CLIENT_ID:
+        logger.warning("Google token audience mismatch")
+        raise HTTPException(status_code=401, detail="Invalid Google token audience")
+    if idinfo.get("iss") not in {"accounts.google.com", "https://accounts.google.com"}:
+        logger.warning("Google token issuer invalid")
+        raise HTTPException(status_code=401, detail="Invalid Google token issuer")
+    if not idinfo.get("email_verified"):
+        logger.warning("Unverified Google account email rejected")
+        raise HTTPException(status_code=401, detail="Email not verified with Google")
+    if settings.GOOGLE_ALLOWED_DOMAIN:
+        email_val = idinfo.get("email", "") or ""
+        if not email_val.endswith(f"@{settings.GOOGLE_ALLOWED_DOMAIN}"):
+            logger.warning("Google account domain not allowed")
+            raise HTTPException(status_code=403, detail="Email domain not allowed")
+
+    google_sub = idinfo.get("sub")
+    email = idinfo.get("email")
+    name = idinfo.get("name") or ""
+    picture = idinfo.get("picture")
+
+    if not google_sub:
+        raise HTTPException(status_code=400, detail="Invalid Google token payload")
+
+    # Upsert user
+    user = db.query(User).filter(User.google_id == google_sub).first()
+    if not user and email:
+        user = db.query(User).filter(User.email == email).first()
+    if not user:
+        user = User(
+            name=name,
+            email=email or f"user_{google_sub}@example.com",
+            google_id=google_sub,
+            profile_pic=picture,
+            role="user"
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        logger.info(f"Created new user via direct Google sign-in: {user.email}")
+    else:
+        # Ensure google_id attached
+        if not user.google_id:
+            user.google_id = google_sub
+            db.commit()
+
+    access_token = create_access_token({"user_id": user.id, "email": user.email})
+    refresh_token = create_refresh_token({"user_id": user.id})
+    user.refresh_token = refresh_token
+    db.commit()
 
     return {
         "success": True,
-        "message": "Authorization URL generated",
-        "data": {"authorization_url": authorization_url}
-    }
-
-@router.post("/google/callback")
-async def google_callback(
-    request: Request,
-    db: Session = Depends(get_db)
-):
-    """Handle Google OAuth callback - supports both OAuth codes and JWT credentials"""
-    try:
-        body = await request.json()
-        
-        # Check if we have a JWT credential (Google Identity Services)
-        credential = body.get("credential")
-        oauth_code = body.get("code")
-        
-        user_info = None
-        
-        if credential:
-            # Handle Google Identity Services JWT credential
-            try:
-                # Decode without verification first to get header
-                header = jwt.get_unverified_header(credential)
-                
-                # Get Google's public keys to verify the JWT
-                async with httpx.AsyncClient() as client:
-                    keys_response = await client.get("https://www.googleapis.com/oauth2/v3/certs")
-                    keys = keys_response.json()
-                
-                # Find the key that matches the JWT's kid
-                key = None
-                for k in keys["keys"]:
-                    if k["kid"] == header["kid"]:
-                        key = jwt.algorithms.RSAAlgorithm.from_jwk(k)
-                        break
-                
-                if not key:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="Invalid JWT key"
-                    )
-                
-                # Verify and decode the JWT
-                payload = jwt.decode(
-                    credential,
-                    key,
-                    algorithms=["RS256"],
-                    audience=settings.GOOGLE_CLIENT_ID
-                )
-                
-                # Extract user info from JWT payload
-                user_info = {
-                    "id": payload.get("sub"),
-                    "email": payload.get("email"),
-                    "name": payload.get("name"),
-                    "picture": payload.get("picture"),
-                    "email_verified": payload.get("email_verified", False)
-                }
-                
-            except jwt.InvalidTokenError as e:
-                logger.error(f"JWT verification failed: {e}")
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid Google credential"
-                )
-                
-        elif oauth_code:
-            # Handle traditional OAuth authorization code
-            token_url = "https://oauth2.googleapis.com/token"
-            token_data = {
-                "client_id": settings.GOOGLE_CLIENT_ID,
-                "client_secret": settings.GOOGLE_CLIENT_SECRET,
-                "code": oauth_code,
-                "grant_type": "authorization_code",
-                "redirect_uri": settings.GOOGLE_REDIRECT_URI,
-            }
-
-            async with httpx.AsyncClient() as client:
-                token_response = await client.post(token_url, data=token_data)
-
-            if token_response.status_code != 200:
-                logger.error(f"Token exchange failed: {token_response.text}")
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Failed to exchange code for tokens"
-                )
-
-            tokens = token_response.json()
-            access_token = tokens.get("access_token")
-
-            # Get user info from Google
-            user_info_url = f"https://www.googleapis.com/oauth2/v2/userinfo?access_token={access_token}"
-
-            async with httpx.AsyncClient() as client:
-                user_response = await client.get(user_info_url)
-
-            if user_response.status_code != 200:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Failed to get user information"
-                )
-
-            user_info = user_response.json()
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Either credential or code is required"
-            )
-        
-        if not user_info or not user_info.get("id"):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to get user information from Google"
-            )
-
-        # Check if user exists
-        user = db.query(User).filter(User.google_id == user_info["id"]).first()
-
-        if not user:
-            # Create new user
-            user = User(
-                name=user_info.get("name", ""),
-                email=user_info.get("email", ""),
-                google_id=user_info["id"],
-                profile_pic=user_info.get("picture"),
-                role="user"
-            )
-            db.add(user)
-            db.commit()
-            db.refresh(user)
-            logger.info(f"Created new user: {user.email}")
-
-        # Create JWT tokens
-        jwt_access_token = create_access_token({"user_id": user.id, "email": user.email})
-        jwt_refresh_token = create_refresh_token({"user_id": user.id})
-
-        # Update user's refresh token
-        user.refresh_token = jwt_refresh_token
-        db.commit()
-
-        return {
-            "success": True,
-            "message": "Authentication successful",
-            "data": {
-                "access_token": jwt_access_token,
-                "refresh_token": jwt_refresh_token,
-                "user": {
-                    "id": user.id,
-                    "name": user.name,
-                    "email": user.email,
-                    "profile_pic": user.profile_pic,
-                    "role": user.role
-                }
+        "message": "Authentication successful",
+        "data": {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "user": {
+                "id": user.id,
+                "name": user.name,
+                "email": user.email,
+                "profile_pic": user.profile_pic,
+                "role": user.role
             }
         }
+    }
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Authentication error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Authentication failed"
-        )
+@router.post("/google/code", summary="Google OAuth Code Exchange (DISABLED)")
+async def google_code_exchange(payload: dict, db: Session = Depends(get_db)):
+    """(Disabled) Previously accepted { code: <authorization_code> }.
+    OAuth authorization code flow has been disabled in favor of One Tap / ID token popup only.
+    """
+    raise HTTPException(status_code=410, detail="Google OAuth code flow disabled. Use direct credential endpoint /api/auth/google.")
 
+# (Original implementation removed for security / simplification.)
 
 @router.get("/me", response_model=UserResponse)
 async def me(current_user: User = Depends(get_current_user)):
