@@ -106,10 +106,22 @@ class Settings(BaseSettings):
     
     # Logging
     LOG_LEVEL: str = "INFO"
+
+    # UPI reconciliation / IMAP settings
+    RECON_ENABLED: bool = os.getenv("RECON_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+    RECON_SOURCE: str = os.getenv("RECON_SOURCE", "none")  # none | gmail_imap | dummy
+    RECON_INTERVAL_SECONDS: int = int(os.getenv("RECON_INTERVAL_SECONDS", "120"))
+    RECON_LOOKBACK_MINUTES: int = int(os.getenv("RECON_LOOKBACK_MINUTES", "180"))
+    IMAP_HOST: str = os.getenv("IMAP_HOST", "imap.gmail.com")
+    IMAP_PORT: int = int(os.getenv("IMAP_PORT", "993"))
+    IMAP_USER: str = os.getenv("IMAP_USER", "")
+    IMAP_PASSWORD: str = os.getenv("IMAP_PASSWORD", "")
+    IMAP_FOLDER: str = os.getenv("IMAP_FOLDER", "INBOX")
     
     model_config = {
         "env_file": ".env",
-        "extra": "ignore"
+        "extra": "ignore",
+        "from_attributes": True,
     }
 
 # Create global settings instance
