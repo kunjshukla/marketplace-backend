@@ -93,7 +93,8 @@ class Settings(BaseSettings):
         "https://vercel.app",
         "https://*.vercel.app",
         "https://netlify.app", 
-        "https://*.netlify.app"
+        "https://*.netlify.app",
+        "https://marketplace-frontend-taupe-chi.vercel.app"
     ]
     
     # Rate limiting
