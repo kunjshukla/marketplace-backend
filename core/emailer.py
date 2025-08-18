@@ -108,6 +108,7 @@ async def send_upi_qr_email(
         logger.error(f"Error sending UPI QR email: {e}")
         return False
 
+
 def generate_upi_qr_code(transaction: Transaction) -> Path:
     """Generate UPI QR code image"""
     try:
@@ -191,4 +192,117 @@ def send_payment_receipt_email(user_email: str, user_name: str, transaction: Tra
         return True
     except Exception as e:
         logger.warning("Failed to send payment receipt: %s", e)
+        return False
+
+
+# --- New helper: generate invoice PDF and send purchase email with attachments ---
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+import requests
+from models.nft import NFT
+from datetime import datetime
+from email.mime.application import MIMEApplication
+
+
+def generate_invoice_pdf(transaction: Transaction, nft: NFT, buyer_name: str, output_dir: Path = None) -> Path:
+    """Generate a simple invoice PDF and return path. Synchronous helper."""
+    try:
+        if output_dir is None:
+            output_dir = Path(__file__).parent.parent / "images" / "invoices"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        pdf_path = output_dir / f"invoice_tx_{transaction.id}.pdf"
+
+        c = canvas.Canvas(str(pdf_path), pagesize=A4)
+        width, height = A4
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(40, height - 60, "NFT Marketplace - Invoice")
+        c.setFont("Helvetica", 10)
+        c.drawString(40, height - 90, f"Invoice #: INV-{transaction.id}")
+        c.drawString(40, height - 105, f"Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+
+        c.drawString(40, height - 140, f"Buyer: {buyer_name}")
+        c.drawString(40, height - 155, f"Buyer Email: {transaction.user.email if hasattr(transaction, 'user') and transaction.user else ''}")
+
+        c.drawString(40, height - 190, "Item:")
+        c.drawString(80, height - 205, f"{nft.title} (NFT #{nft.id})")
+        c.drawString(80, height - 220, f"Category: {nft.category or ''}")
+
+        c.drawString(40, height - 260, f"Amount: {transaction.amount} {transaction.currency}")
+
+        c.drawString(40, height - 300, "Thank you for your purchase.")
+
+        c.showPage()
+        c.save()
+        logger.info("Generated invoice PDF: %s", pdf_path)
+        return pdf_path
+    except Exception as e:
+        logger.error("Failed to generate invoice PDF: %s", e)
+        return None
+
+
+def send_purchase_email_with_attachments(
+    to_email: str,
+    buyer_name: str,
+    transaction: Transaction,
+    nft: NFT,
+    invoice_path: Path = None
+) -> bool:
+    """Send purchase email with invoice and artwork (if available) as attachments. Synchronous helper."""
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = settings.SMTP_USER
+        msg['To'] = to_email
+        msg['Subject'] = f"Your NFT Purchase - Transaction #{transaction.id}"
+
+        # Simple HTML body
+        body_html = f"""
+        <html>
+        <body>
+        <p>Hi {buyer_name},</p>
+        <p>Thank you for your purchase of <strong>{nft.title}</strong> (#{nft.id}).</p>
+        <p>Transaction ID: <strong>{transaction.id}</strong><br>
+        Reference: {transaction.txn_ref or 'N/A'}</p>
+        <p>The invoice is attached to this email. Please keep it for your records.</p>
+        </body>
+        </html>
+        """
+        msg.attach(MIMEText(body_html, 'html'))
+
+        # Attach invoice PDF if provided
+        if invoice_path and invoice_path.exists():
+            with open(invoice_path, 'rb') as f:
+                part = MIMEApplication(f.read(), _subtype='pdf')
+                part.add_header('Content-Disposition', 'attachment', filename=invoice_path.name)
+                msg.attach(part)
+
+        # Attach artwork image if remotely available
+        art_url = getattr(nft, 'image_url', None) or None
+        if art_url:
+            try:
+                resp = requests.get(art_url, timeout=10)
+                if resp.status_code == 200:
+                    img = MIMEImage(resp.content)
+                    img.add_header('Content-Disposition', 'attachment', filename=f"nft_{nft.id}.png")
+                    msg.attach(img)
+            except Exception as e:
+                logger.warning("Failed to fetch artwork for attachment: %s", e)
+
+        # Attach optional legal PDF if exists in docs/legal.pdf
+        legal_path = Path(__file__).parent.parent / 'docs' / 'legal.pdf'
+        if legal_path.exists():
+            try:
+                with open(legal_path, 'rb') as f:
+                    part = MIMEApplication(f.read(), _subtype='pdf')
+                    part.add_header('Content-Disposition', 'attachment', filename=legal_path.name)
+                    msg.attach(part)
+            except Exception as e:
+                logger.warning("Failed to attach legal doc: %s", e)
+
+        smtp = create_smtp_client()
+        smtp.send_message(msg)
+        smtp.quit()
+        logger.info("Sent purchase email to %s for tx %s", to_email, transaction.id)
+        return True
+    except Exception as e:
+        logger.error("Failed to send purchase email: %s", e)
         return False

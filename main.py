@@ -22,6 +22,7 @@ from api.auth import router as auth_router
 from api.nft import router as nft_router
 from api.payment import router as payment_router
 from api.email import router as email_router
+from api.purchase import router as purchase_router
 from models import *  # noqa: F401,F403 ensure model registration
 from core.reconciliation import start_reconciliation_scheduler, shutdown_reconciliation_scheduler
 
@@ -200,10 +201,14 @@ app.include_router(auth_router, prefix="/api")
 app.include_router(nft_router, prefix="/api")
 app.include_router(payment_router, prefix="/api")
 app.include_router(email_router, prefix="/api")
+app.include_router(purchase_router, prefix="/api")
 
 # Backward-compatibility: also expose NFT routes at /nft/* (no /api prefix)
 # This handles older frontend requests like `/nft/list?page=1&limit=50`.
 app.include_router(nft_router)
+
+# Also expose purchase endpoints at top-level /purchase for legacy clients
+app.include_router(purchase_router)
 
 def custom_openapi():
     if app.openapi_schema:
